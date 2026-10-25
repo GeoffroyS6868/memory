@@ -1,0 +1,21 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@theme static {
+  --font-sans: 'Public Sans', sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+@utility squircle {
+  border-radius: 1.25rem;
+
+  @supports (corner-shape: squircle) {
+    border-radius: 2rem;
+    corner-shape: squircle;
+  }
+}
