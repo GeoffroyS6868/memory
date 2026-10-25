@@ -1,17 +1,11 @@
 <script setup lang="ts">
-import type { DriftParams } from '~/utils/drift'
+import type { DriftParams, Kick, Vec3 } from '~/utils/drift'
 
 const props = defineProps<{ memos: Memo[] }>()
 const emit = defineEmits<{
   toggle: [id: string]
   remove: [id: string]
 }>()
-
-interface Flight {
-  x: number
-  y: number
-  startedAt: number | null
-}
 
 interface Pop {
   startedAt: number | null
@@ -22,53 +16,113 @@ interface Item {
   el: HTMLElement | null
   params: DriftParams
   bornAt: number | null
-  flight: Flight | null
+  kick: Kick | null
+  w: number
+  h: number
   doneBlend: number | null
   focusBlend: number
   pop: Pop | null
+  held: boolean
 }
 
-const FLIGHT_MS = 1400
 const FADE_MS = 900
+const KICK_MAX_DT = 0.05
+// Bottom wall = top of the input area, as a distance from the viewport bottom
+const FLOOR_MARGIN = 96
 const POP_MS = 450
 const POP_SCALE = 0.25
 const DONE_TAU = 0.3
 const DONE_DEPTH = 0.3
 const FOCUS_TAU = 0.1
+const LAUNCH_Z_INDEX = 1000
 
 const items = new Map<string, Item>()
 let raf = 0
 let width = 0
 let height = 0
+let floorY = 0
 let t0 = 0
 let last = 0
 let reducedMotion = false
 let media: MediaQueryList | null = null
 
-function getItem(id: string, zRange?: readonly [number, number]): Item {
+function getItem(id: string): Item {
   let item = items.get(id)
   if (!item) {
-    item = { el: null, params: createDrift(id, zRange), bornAt: null, flight: null, doneBlend: null, focusBlend: 0, pop: null }
+    item = { el: null, params: createDrift(id), bornAt: null, kick: null, w: 0, h: 0, doneBlend: null, focusBlend: 0, pop: null, held: false }
     items.set(id, item)
   }
   return item
 }
 
+function measureItem(item: Item) {
+  if (!item.el) return
+  item.w = item.el.offsetWidth
+  item.h = item.el.offsetHeight
+}
+
 function setEl(id: string, el: unknown) {
-  if (el instanceof HTMLElement) getItem(id).el = el
-  else {
+  if (el instanceof HTMLElement) {
+    const item = getItem(id)
+    item.el = el
+    measureItem(item)
+    if (item.held) el.setAttribute('data-held', '')
+    // A launched bubble starts fully visible: no fade-in, no opacity transition from 0
+    if (item.kick) el.style.setProperty('--o', '1')
+  } else {
     const item = items.get(id)
     if (item) item.el = null
   }
 }
 
-function launch(id: string, rect: DOMRect) {
-  if (reducedMotion) return
-  const item = getItem(id, [0.25, 0.55])
-  item.flight = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, startedAt: null }
+// Mounted but invisible and ignored by the frame loop until launch(); still measured
+function hold(id: string) {
+  const item = getItem(id)
+  item.held = true
+  item.el?.setAttribute('data-held', '')
 }
 
-defineExpose({ launch })
+function size(id: string) {
+  const item = items.get(id)
+  return item?.w ? { w: item.w, h: item.h } : null
+}
+
+function release(item: Item, rect: DOMRect | null) {
+  item.held = false
+  const el = item.el
+  if (!el) return
+  if (!rect) {
+    el.removeAttribute('data-held')
+    return
+  }
+  // Shown at once where the drop was: no opacity transition, no frame at the wrong place
+  el.style.transition = 'none'
+  el.style.setProperty('--o', '1')
+  el.style.zIndex = String(LAUNCH_Z_INDEX)
+  el.style.transform = `translate3d(${(rect.left + rect.width / 2).toFixed(2)}px, ${(rect.top + rect.height / 2).toFixed(2)}px, 0) translate(-50%, -50%)`
+  el.removeAttribute('data-held')
+  el.getBoundingClientRect()
+  el.style.transition = ''
+
+  const p = el.querySelector('p')
+  p?.setAttribute('data-reveal', '')
+  p?.addEventListener('animationend', () => p.removeAttribute('data-reveal'), { once: true })
+}
+
+function launch(id: string, rect: DOMRect, vel: Vec3 = launchVelocity()) {
+  const item = getItem(id)
+  release(item, reducedMotion ? null : rect)
+  if (reducedMotion) return
+  const start = unproject(rect.left + rect.width / 2, rect.top + rect.height / 2, 0, width, height)
+  const drift = driftAt(item.params, (performance.now() - t0) / 1000)
+  item.bornAt = Number.NEGATIVE_INFINITY
+  item.kick = {
+    offset: { x: start.x - drift.x, y: start.y - drift.y, z: -drift.z },
+    vel
+  }
+}
+
+defineExpose({ hold, size, launch })
 
 function onToggle(id: string) {
   if (items.get(id)?.pop) return
@@ -95,11 +149,27 @@ function onKeydown(e: KeyboardEvent, id: string) {
 }
 
 const lerp = (a: number, b: number, k: number) => a + (b - a) * k
+const clamp01 = (v: number) => Math.min(1, Math.max(0, v))
 const easeOutCubic = (k: number) => 1 - (1 - k) ** 3
 
 function measure() {
   width = window.innerWidth
   height = window.innerHeight
+  floorY = height - FLOOR_MARGIN
+  for (const item of items.values()) measureItem(item)
+}
+
+// Edge past a wall while moving into it: reflect (damped) and return the pixel correction
+function bounce(vel: Kick['vel'], axis: 'x' | 'y', lo: number, hi: number, min: number, max: number): number {
+  if (lo < min && vel[axis] < 0) {
+    vel[axis] *= -RESTITUTION
+    return min - lo
+  }
+  if (hi > max && vel[axis] > 0) {
+    vel[axis] *= -RESTITUTION
+    return max - hi
+  }
+  return 0
 }
 
 function frame(now: number) {
@@ -115,43 +185,64 @@ function frame(now: number) {
 
   for (const memo of props.memos) {
     const item = items.get(memo.id)
-    if (!item?.el) continue
+    if (!item?.el || item.held) continue
 
     const target = memo.done ? 1 : 0
     item.doneBlend ??= target
     item.doneBlend = reducedMotion ? target : target + (item.doneBlend - target) * Math.exp(-dt / DONE_TAU)
 
     const pos = driftAt(item.params, t)
-    pos.z = Math.min(1, Math.max(0, pos.z + DONE_DEPTH * item.doneBlend))
-    const p = project(pos, width, height)
-    let { x, y, scale, opacity, blur, zIndex } = p
-
-    const flight = item.flight
-    if (flight) {
-      flight.startedAt ??= now
-      const k = Math.min(1, (now - flight.startedAt) / FLIGHT_MS)
-      const e = easeOutCubic(k)
-      x = lerp(flight.x, p.x, e)
-      y = lerp(flight.y, p.y, e) - Math.sin(Math.PI * k) * Math.min(90, height * 0.12)
-      scale = lerp(1, p.scale, e)
-      opacity = lerp(1, p.opacity, e)
-      blur = lerp(0, p.blur, e)
-      zIndex = 1001
-      if (k >= 1) item.flight = null
-    } else {
-      item.bornAt ??= now
-      opacity *= Math.min(1, (now - item.bornAt) / FADE_MS)
+    const kick = item.kick
+    if (kick) {
+      stepKick(kick, Math.min(dt, KICK_MAX_DT))
+      pos.x += kick.offset.x
+      pos.y += kick.offset.y
+      pos.z += kick.offset.z
+      // Depth bounces on the combined position, before the "done" recoil
+      if ((pos.z < 0 && kick.vel.z < 0) || (pos.z > 1 && kick.vel.z > 0)) {
+        const wall = pos.z < 0 ? 0 : 1
+        kick.vel.z *= -RESTITUTION
+        kick.offset.z += wall - pos.z
+        pos.z = wall
+      }
     }
+    pos.z = clamp01(pos.z + DONE_DEPTH * item.doneBlend)
+    const p = project(pos, width, height)
+    const { blur } = p
+    let { x, y, scale, opacity, zIndex } = p
+
+    if (kick) {
+      const hw = item.w * scale / 2
+      const hh = item.h * scale / 2
+      const dx = bounce(kick.vel, 'x', x - hw, x + hw, 0, width)
+      const dy = bounce(kick.vel, 'y', y - hh, y + hh, 0, floorY)
+      if (dx || dy) {
+        const n = pixelsToNorm(dx, dy, pos.z, width, height)
+        kick.offset.x += n.x
+        kick.offset.y += n.y
+        x += dx
+        y += dy
+      }
+      if (kickAtRest(kick)) item.kick = null
+    }
+
+    item.bornAt ??= now
+    opacity *= Math.min(1, (now - item.bornAt) / FADE_MS)
 
     // Hovered or focused bubbles come forward to a readable size so their actions stay easy to hit
     // (frozen while popping, so a deleted bubble bursts from where it is)
+    let hovered = false
+    let focused = false
     if (!item.pop) {
-      const active = !flight && item.el.matches(':hover, :focus-within') ? 1 : 0
+      hovered = item.el.matches(':hover')
+      focused = !hovered && item.el.matches(':focus-within')
+      const active = hovered || focused ? 1 : 0
       item.focusBlend = reducedMotion ? active : active + (item.focusBlend - active) * Math.exp(-dt / FOCUS_TAU)
     }
     if (item.focusBlend > 0.001) {
       scale = lerp(scale, Math.max(scale, 1), item.focusBlend)
-      zIndex = 1500
+      // The hovered bubble always wins, then a focused one, then those shrinking back
+      zIndex = hovered ? 1700 : focused ? 1600 : 1500 + Math.round(item.focusBlend * 99)
     }
 
     const pop = item.pop
@@ -254,10 +345,26 @@ onBeforeUnmount(() => {
   filter: none;
 }
 
+[data-bubble][data-held] {
+  opacity: 0;
+  pointer-events: none;
+  transition: none;
+}
+
 [data-bubble][data-popping] {
   opacity: var(--o, 0);
   pointer-events: none;
   transition: none;
+}
+
+[data-reveal] {
+  animation: reveal 0.14s ease-out;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+  }
 }
 
 [data-actions] {
@@ -276,6 +383,10 @@ onBeforeUnmount(() => {
   [data-bubble],
   [data-actions] {
     transition: none;
+  }
+
+  [data-reveal] {
+    animation: none;
   }
 }
 </style>
