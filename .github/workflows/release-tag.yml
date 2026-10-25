@@ -1,0 +1,71 @@
+name: Create Release Tag
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-tag:
+    name: Create Dokploy release tag
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        id: tag
+        shell: bash
+        run: |
+          tag="v$(date -u +'%Y.%m.%d').${GITHUB_RUN_NUMBER}"
+
+          if git rev-parse "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists. Nothing to create."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Created release tag: $tag"
+
+      - name: Publish GitHub Release
+        if: steps.tag.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          release_date="${TAG#v}"
+          release_date="${release_date%.*}"
+
+          notes_file="$(mktemp)"
+          if [ -f CHANGELOG.md ] && awk -v date="$release_date" '
+            BEGIN { found=0 }
+            /^\#\# \[/ {
+              if (found) exit
+              if (index($0, "[" date "]") > 0) found=1
+              next
+            }
+            found { print }
+          ' CHANGELOG.md > "$notes_file" && [ -s "$notes_file" ]; then
+            gh release create "$TAG" --title "Release $TAG" --notes-file "$notes_file"
+          else
+            gh release create "$TAG" --title "Release $TAG" --generate-notes
+          fi
